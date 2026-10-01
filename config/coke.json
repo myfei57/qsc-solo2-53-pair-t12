@@ -15,7 +15,16 @@
     "guide": {
       "align_tolerance_mm": 15.0,
       "apron_lock_travel_mm": 120.0,
-      "apron_lock_timeout_s": 20.0
+      "apron_lock_timeout_s": 20.0,
+      "compensation": {
+        "window": 8,
+        "max_offset_mm": 8.0,
+        "recalibrate_threshold_mm": 10.0,
+        "overrun_policy": "halt",
+        "unit_policies": {
+          "battery1": "continue"
+        }
+      }
     },
     "charger": {
       "align_tolerance_mm": 20.0,

@@ -1,9 +1,9 @@
 """平台配置。
 
-配置来自 JSON 文件（标准库解析），覆盖推焦行程基线、导焦栅对齐公差、集气
-管压力带、熄焦喷淋时长、换向间隔、炉温确认带、除尘挡板联动参数与存储目录。
-任何缺失或越界取值都在装配阶段抛出 :class:`ConfigError`，不允许带着半份
-配置启动控制链。
+配置来自 JSON 文件（标准库解析），覆盖推焦行程基线、导焦栅对齐公差与漂移
+补偿策略、集气管压力带、熄焦喷淋时长、换向间隔、炉温确认带、除尘挡板联动
+参数与存储目录。任何缺失或越界取值都在装配阶段抛出 :class:`ConfigError`，
+不允许带着半份配置启动控制链。
 """
 
 from __future__ import annotations
@@ -70,12 +70,61 @@ class PusherLimits:
 
 
 @dataclass(frozen=True)
+class GuideCompensationLimits:
+    """导焦栅对位漂移补偿约束。
+
+    超限后的处置（继续自动补偿还是停机待标定）按炉组定：``overrun_policy``
+    是缺省策略，``unit_policies`` 按炉组名单独覆盖。
+    """
+
+    POLICIES = ("continue", "halt")
+
+    window: int
+    max_offset_mm: float
+    recalibrate_threshold_mm: float
+    overrun_policy: str
+    unit_policies: dict[str, str]
+
+    @classmethod
+    def from_mapping(cls, section: Mapping[str, Any]) -> "GuideCompensationLimits":
+        window_raw = _number(section, "window", minimum=1.0)
+        if window_raw != int(window_raw):
+            raise ConfigError("补偿窗口必须是整数", component="config")
+        policy = section.get("overrun_policy", _MISSING)
+        if policy is _MISSING:
+            raise ConfigError("配置缺少字段 'overrun_policy'", component="config")
+        if policy not in cls.POLICIES:
+            raise ConfigError("超限策略必须是 continue 或 halt", component="config")
+        raw_units = section.get("unit_policies", {})
+        if not isinstance(raw_units, Mapping):
+            raise ConfigError("配置字段 'unit_policies' 必须是映射", component="config")
+        unit_policies: dict[str, str] = {}
+        for unit, value in raw_units.items():
+            if value not in cls.POLICIES:
+                raise ConfigError(f"炉组 {unit!r} 的超限策略必须是 continue 或 halt", component="config")
+            unit_policies[str(unit)] = str(value)
+        return cls(
+            window=int(window_raw),
+            max_offset_mm=_number(section, "max_offset_mm", minimum=0.1),
+            recalibrate_threshold_mm=_number(section, "recalibrate_threshold_mm", minimum=0.1),
+            overrun_policy=str(policy),
+            unit_policies=unit_policies,
+        )
+
+    def policy_for(self, unit: str) -> str:
+        """返回指定炉组的超限处置策略。"""
+
+        return self.unit_policies.get(unit, self.overrun_policy)
+
+
+@dataclass(frozen=True)
 class GuideLimits:
     """拦焦车导焦栅对齐与锁定约束。"""
 
     align_tolerance_mm: float
     apron_lock_travel_mm: float
     apron_lock_timeout_s: float
+    compensation: GuideCompensationLimits
 
     @classmethod
     def from_mapping(cls, section: Mapping[str, Any]) -> "GuideLimits":
@@ -83,6 +132,7 @@ class GuideLimits:
             align_tolerance_mm=_number(section, "align_tolerance_mm", minimum=0.0),
             apron_lock_travel_mm=_number(section, "apron_lock_travel_mm", minimum=1.0),
             apron_lock_timeout_s=_number(section, "apron_lock_timeout_s", minimum=1.0),
+            compensation=GuideCompensationLimits.from_mapping(_section(section, "compensation")),
         )
 
 
@@ -271,7 +321,7 @@ def default_config() -> PlatformConfig:
         name="sequence-control",
         storage_root="var/state",
         pusher=PusherLimits(3200.0, 25.0, 3350.0, 12.0, 38.0, 24.0),
-        guide=GuideLimits(15.0, 120.0, 20.0),
+        guide=GuideLimits(15.0, 120.0, 20.0, GuideCompensationLimits(8, 8.0, 10.0, "halt", {})),
         charger=ChargerLimits(20.0, 28.0, 4.0),
         quench=QuenchLimits(42.0, 1.6, 90.0, 320.0),
         collector=CollectorLimits(90.0, 18.0, 6.0),
@@ -299,6 +349,13 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
                 "align_tolerance_mm": cfg.guide.align_tolerance_mm,
                 "apron_lock_travel_mm": cfg.guide.apron_lock_travel_mm,
                 "apron_lock_timeout_s": cfg.guide.apron_lock_timeout_s,
+                "compensation": {
+                    "window": cfg.guide.compensation.window,
+                    "max_offset_mm": cfg.guide.compensation.max_offset_mm,
+                    "recalibrate_threshold_mm": cfg.guide.compensation.recalibrate_threshold_mm,
+                    "overrun_policy": cfg.guide.compensation.overrun_policy,
+                    "unit_policies": dict(cfg.guide.compensation.unit_policies),
+                },
             },
             "charger": {
                 "align_tolerance_mm": cfg.charger.align_tolerance_mm,

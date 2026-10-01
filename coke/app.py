@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 import threading
 
 from .audit.log import AuditLog
@@ -27,6 +28,7 @@ from .eventbus import Event, EventBus
 from .gas.collector import CollectorMain
 from .gas.flap import BridgeFlap
 from .gas.latch import FlapLatch
+from .guide.compensation import GuideCompensator, migrate_state
 from .guide.machine import GuideCar
 from .heating.machine import HeatingReversal
 from .heating.snapshot import HeatingSnapshot
@@ -80,6 +82,8 @@ class Platform:
             self.config.pusher.speed_default_mm_s,
         )
         self.guide = GuideCar(self.config.guide)
+        self.guide_comp = GuideCompensator(self.unit, self.config.guide.compensation)
+        self._compensation_doc = f"guide_compensation_{self.unit}"
         self.charger = ChargingCar(self.config.charger)
         self.quench_car = QuenchCar(self.config.quench)
         self.collector = CollectorMain(self.config.collector)
@@ -97,6 +101,7 @@ class Platform:
         self._lock = threading.RLock()
         self._register_namespaces()
         self._restore()
+        self._restore_compensation()
 
     def _register_namespaces(self) -> None:
         """登记现场设备命名空间（控制台与审计共用同一套名字）。"""
@@ -130,6 +135,74 @@ class Platform:
         if isinstance(state, dict):
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
+
+    def _restore_compensation(self) -> None:
+        """装入本炉组落盘的补偿状态；结构版本过旧时先迁移再装入并留痕。"""
+
+        raw = self.store.read(self._compensation_doc)
+        if raw is None:
+            return
+        state, migrations = migrate_state(raw, self.unit)
+        self.guide_comp.load_state(state)
+        if migrations:
+            self._persist_compensation()
+            self.bus.publish(
+                Event.of(
+                    "guide",
+                    "guide",
+                    "guide_compensation_migrated",
+                    severity="warning",
+                    message="导焦栅补偿状态结构已迁移",
+                    unit=self.unit,
+                    epoch=self.guide_comp.epoch,
+                    migrations=migrations,
+                )
+            )
+
+    def _persist_compensation(self) -> None:
+        """落盘本炉组的补偿状态。"""
+
+        self.store.write(self._compensation_doc, self.guide_comp.state_dict())
+
+    def _publish_compensation(self, decision: dict) -> None:
+        """把一次补偿判定落审计；漂移超限时按炉组策略报警。"""
+
+        # 判定时间戳与审计记录自身的 ts 是同一时钟时刻，不重复进负载，
+        # 避免与审计落账的 ts 字段撞名。
+        payload = {key: value for key, value in decision.items() if key != "ts"}
+        self.bus.publish(
+            Event.of(
+                "guide",
+                "guide",
+                "guide_compensated",
+                severity="notice",
+                message=f"导焦栅对位补偿 {decision['offset_after_mm']}mm",
+                **payload,
+            )
+        )
+        if decision["overrun"]:
+            handling = "halt" if decision["halted"] else "continue"
+            threshold = self.config.guide.compensation.recalibrate_threshold_mm
+            self.bus.publish(
+                Event.of(
+                    "guide",
+                    "guide",
+                    "guide_drift_overrun",
+                    severity="alarm",
+                    message=(
+                        f"导焦栅漂移 {decision['drift_mm']}mm 超限（阈值 {threshold}mm），"
+                        f"按炉组策略{'停机待标定' if handling == 'halt' else '继续补偿'}"
+                    ),
+                    op_id=decision["op_id"],
+                    unit=self.unit,
+                    oven=decision["oven"],
+                    epoch=decision["epoch"],
+                    drift_mm=decision["drift_mm"],
+                    threshold_mm=threshold,
+                    policy=decision["policy"],
+                    handling=handling,
+                )
+            )
 
     def _persist(self) -> None:
         """落盘平台计数，供重启后对照。"""
@@ -241,10 +314,28 @@ class Platform:
         speed_mm_s: float | None = None,
         dt: float = 1.0,
     ) -> dict:
-        """推焦编排：导焦栅对位 → 锁定 → 推焦 → 退杆；同时触发除尘联动。"""
+        """推焦编排：导焦栅对位 → 锁定 → 推焦 → 退杆；同时触发除尘联动。
+
+        对位目标先经本炉组补偿器换算（漂移补偿）；若漂移超限且炉组策略为
+        停机待标定，推焦直接被联锁拒绝。
+        """
 
         with self._lock:
             op_id = self.ids.next()
+            if self.guide_comp.halted():
+                report = {
+                    "oven": oven,
+                    "ok": False,
+                    "steps": [],
+                    "violations": ["guide_recalibration_required"],
+                    "compensation": self.guide_comp.status(),
+                }
+                summary = self._record_operation(op_id, "push", report)
+                summary["op_id"] = op_id
+                self._operations += 1
+                self._persist()
+                return {**report, **summary}
+            plan = self.guide_comp.plan(guide_target_mm)
             target = self.stroke.baseline_mm if stroke_target_mm is None else stroke_target_mm
             self.speed.request("auto_cycle", speed_mm_s or self.config.pusher.speed_default_mm_s, priority=50)
             arbitration = self.speed.resolve()
@@ -253,7 +344,7 @@ class Platform:
                 self.pusher,
                 self.guide,
                 oven,
-                guide_target_mm,
+                plan["commanded_mm"],
                 guide_measured_mm,
                 target,
                 arbitration.speed_mm_s,
@@ -262,6 +353,12 @@ class Platform:
             stroke_check = self.stroke.check(self.pusher.ram_mm)
             report["speed_arbitration"] = arbitration.as_dict()
             report["stroke_check"] = stroke_check
+            align_step = next((step for step in report["steps"] if step["action"] == "align_apron"), None)
+            if align_step is not None:
+                decision = self.guide_comp.observe(oven, plan, guide_measured_mm, self.clock.now(), op_id)
+                self._persist_compensation()
+                self._publish_compensation(decision)
+                report["compensation"] = decision
             summary = self._record_operation(op_id, "push", report)
             summary["op_id"] = op_id
             self._operations += 1
@@ -388,6 +485,44 @@ class Platform:
         )
         return {"before_mm": before, "after_mm": after, "epoch": self.stroke.epoch}
 
+    def recalibrate_guide(self, baseline_mm: float) -> dict:
+        """重新标定导焦栅补偿基线（标定版本换代，按迁移处理并落审计）。"""
+
+        if isinstance(baseline_mm, bool) or not math.isfinite(float(baseline_mm)):
+            raise CokeError("标定基线必须是有限数值", component="guide")
+        with self._lock:
+            migration = self.guide_comp.recalibrate(baseline_mm, self.clock.now())
+            self._persist_compensation()
+            # 迁移时刻与审计记录自身的 ts 是同一时钟时刻，不重复进负载。
+            payload = {key: value for key, value in migration.items() if key != "ts"}
+            self.bus.publish(
+                Event.of(
+                    "guide",
+                    "guide",
+                    "guide_baseline_migrated",
+                    severity="notice",
+                    message=(
+                        f"导焦栅补偿基线换代 {migration['from_epoch']}→{migration['to_epoch']}"
+                    ),
+                    unit=self.unit,
+                    **payload,
+                )
+            )
+            return dict(migration)
+
+    def review_guide_compensation(self) -> dict:
+        """复查本炉组补偿判定：重算判定链并与审计流水核对。"""
+
+        with self._lock:
+            records = self.audit.to_records(self.audit.replay_from_journal(limit=100_000))
+            return self.guide_comp.review(records)
+
+    def guide_compensation_view(self, limit: int = 50) -> dict:
+        """返回补偿状态与最近判定，供控制台展示。"""
+
+        with self._lock:
+            return {**self.guide_comp.status(), "decisions": self.guide_comp.decisions(limit)}
+
     def disturb_collector(self, delta_pa: float) -> dict:
         """模拟一次集气管扰动，返回扰动后压力。"""
 
@@ -468,7 +603,7 @@ class Platform:
                 "tolerance_mm": self.stroke.tolerance_mm,
                 "epoch": self.stroke.epoch,
             },
-            "guide": self.guide.snapshot().as_dict(),
+            "guide": {**self.guide.snapshot().as_dict(), "compensation": self.guide_comp.status()},
             "charger": self.charger.snapshot().as_dict(),
             "quench": self.quench_car.snapshot().as_dict(),
             "gas": {

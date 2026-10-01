@@ -46,6 +46,9 @@ class Api:
         add("GET", "/api/timeline", self._timeline)
         add("GET", "/api/journal", self._journal)
         add("GET", "/api/readiness", self._readiness)
+        add("GET", "/api/guide/compensation", self._guide_compensation)
+        add("GET", "/api/guide/compensation/review", self._guide_compensation_review)
+        add("POST", "/api/guide/recalibrate", self._guide_recalibrate)
         add("POST", "/api/step", self._step)
         add("POST", "/api/charge", self._charge)
         add("POST", "/api/push", self._push)
@@ -140,6 +143,17 @@ class Api:
 
     def _step(self, params: dict, body: dict) -> dict:
         return self._platform.cycle(dt=_as_float(body, "dt", 1.0))
+
+    def _guide_compensation(self, params: dict, body: dict) -> dict:
+        return self._platform.guide_compensation_view(limit=int(params.get("limit", 50)))
+
+    def _guide_compensation_review(self, params: dict, body: dict) -> dict:
+        return self._platform.review_guide_compensation()
+
+    def _guide_recalibrate(self, params: dict, body: dict) -> dict:
+        return self._platform.recalibrate_guide(
+            _as_float(body, "baseline_mm", self._platform.guide_comp.baseline_mm)
+        )
 
     def _charge(self, params: dict, body: dict) -> dict:
         return self._platform.charge(
