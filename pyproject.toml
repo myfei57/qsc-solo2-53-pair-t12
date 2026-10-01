@@ -18,6 +18,7 @@ packages = [
     "coke.audit",
     "coke.pusher",
     "coke.guide",
+    "coke.compensation",
     "coke.charger",
     "coke.quench",
     "coke.gas",

@@ -3,6 +3,23 @@
     "name": "sequence-control",
     "storage_root": "var/state"
   },
+  "guide_compensation": {
+    "scope": "battery_group",
+    "sample_window": 20,
+    "min_samples": 3,
+    "deadband_mm": 2.0,
+    "drift_limit_mm": 10.0,
+    "max_step_mm": 5.0,
+    "max_correction_mm": 20.0,
+    "group_policies": {
+      "battery1": "recalibrate",
+      "battery2": "compensate"
+    },
+    "nominal_targets_mm": {
+      "battery1": 0.0,
+      "battery2": 0.0
+    }
+  },
   "limits": {
     "pusher": {
       "stroke_baseline_mm": 3200.0,

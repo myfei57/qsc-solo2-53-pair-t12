@@ -6,6 +6,8 @@
 ``demo``    在本地跑一遍完整流程（启动 → 装煤 → 换向 → 推焦 → 熄焦 → 清扫 →
             控制周期 → 并发探测 → 行程标定），用于交付前的真实运行检查；
 ``status``  打印当前状态快照；
+``guide``   打印各炉组导焦栅漂移补偿状态（版本、偏移、是否被停机要求重新标定）；
+``guide-recalibrate`` 某炉组导焦栅重新标定，标定基线换代（版本迁移）；
 ``config``  打印生效配置；
 ``reset``   清掉落盘的平台计数。
 """
@@ -99,6 +101,8 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "cleaning": {"ok": cleaning["ok"], "steps": [step["action"] for step in cleaning["steps"]]},
         "concurrency": concurrency,
         "calibration": calibration,
+        "guide_compensation": platform.guide_compensation_summary(),
+        "guide_drift_blocked_groups": platform.guide_drift_blocked_groups(),
         "shutdown": shutdown,
         "probe": probe,
         "audit": platform.audit.summary(),
@@ -128,6 +132,26 @@ def _cmd_config(args: argparse.Namespace) -> int:
     config_path = getattr(args, "config", None)
     config = load_config(config_path) if config_path else default_config()
     _dump(config_to_mapping(config))
+    return 0
+
+
+def _cmd_guide_status(args: argparse.Namespace) -> int:
+    platform = _build(args)
+    payload = platform.guide_compensation_summary()
+    payload["blocked_groups"] = platform.guide_drift_blocked_groups()
+    _dump(payload)
+    return 0
+
+
+def _cmd_guide_recalibrate(args: argparse.Namespace) -> int:
+    platform = _build(args)
+    payload = platform.recalibrate_guide(
+        group=args.group,
+        nominal_target_mm=args.target_mm,
+        measured_mm=args.measured_mm if args.measured_mm is not None else args.target_mm,
+        reason=args.reason,
+    )
+    _dump(payload)
     return 0
 
 
@@ -167,6 +191,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     config = sub.add_parser("config", help="打印生效配置", parents=[common])
     config.set_defaults(func=_cmd_config)
+
+    guide_status = sub.add_parser("guide", help="打印各炉组导焦栅漂移补偿状态", parents=[common])
+    guide_status.set_defaults(func=_cmd_guide_status)
+
+    guide_recal = sub.add_parser(
+        "guide-recalibrate", help="某炉组导焦栅重新标定（标定基线换代迁移）", parents=[common]
+    )
+    guide_recal.add_argument("--group", default="battery1", help="炉组标识")
+    guide_recal.add_argument("--target-mm", type=float, required=True, help="新的标定名义目标位 mm")
+    guide_recal.add_argument("--measured-mm", type=float, default=None, help="本次实测位置 mm（默认同目标位）")
+    guide_recal.add_argument("--reason", default="命令行触发重新标定", help="标定原因")
+    guide_recal.set_defaults(func=_cmd_guide_recalibrate)
 
     reset = sub.add_parser("reset", help="清掉落盘的平台计数", parents=[common])
     reset.set_defaults(func=_cmd_reset)

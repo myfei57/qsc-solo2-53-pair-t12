@@ -45,6 +45,10 @@ class Api:
         add("GET", "/api/store", self._store)
         add("GET", "/api/timeline", self._timeline)
         add("GET", "/api/journal", self._journal)
+        add("GET", "/api/guide-compensation", self._guide_compensation)
+        add("GET", "/api/guide-compensation/history", self._guide_comp_history)
+        add("GET", "/api/guide-compensation/review", self._guide_comp_review)
+        add("POST", "/api/guide-recalibrate", self._guide_recalibrate)
         add("GET", "/api/readiness", self._readiness)
         add("POST", "/api/step", self._step)
         add("POST", "/api/charge", self._charge)
@@ -134,6 +138,7 @@ class Api:
             "flap_latch_engaged": platform.flap.latch.is_engaged(),
             "guide_locked": platform.guide.is_locked(),
             "damper_deg": round(platform.damper.angle_deg, 2),
+            "guide_drift_blocked_groups": platform.guide_drift_blocked_groups(),
             "last_audit_ts": recent[-1]["ts"] if recent else None,
         }
         return {"ready": all(checks.values()), "checks": checks, "info": info}
@@ -157,6 +162,7 @@ class Api:
             stroke_target_mm=_as_float(body, "stroke_target_mm", self._platform.stroke.baseline_mm),
             speed_mm_s=_as_float(body, "speed_mm_s", self._platform.config.pusher.speed_default_mm_s),
             dt=_as_float(body, "dt", 1.0),
+            group=str(body.get("group") or self._platform.unit),
         )
 
     def _quench(self, params: dict, body: dict) -> dict:
@@ -178,6 +184,28 @@ class Api:
 
     def _calibrate(self, params: dict, body: dict) -> dict:
         return self._platform.calibrate_stroke(_as_float(body, "value_mm", self._platform.stroke.baseline_mm))
+
+    def _guide_compensation(self, params: dict, body: dict) -> dict:
+        return self._platform.guide_compensation_summary()
+
+    def _guide_comp_history(self, params: dict, body: dict) -> dict:
+        group = str(params.get("group", self._platform.unit))
+        return self._platform.guide_compensation_history(
+            group, limit=int(params.get("limit", 200))
+        )
+
+    def _guide_comp_review(self, params: dict, body: dict) -> dict:
+        group = str(params.get("group", self._platform.unit))
+        return self._platform.guide_compensation_review(
+            group, limit=int(params.get("limit", 200))
+        )
+
+    def _guide_recalibrate(self, params: dict, body: dict) -> dict:
+        group = str(body.get("group") or self._platform.unit)
+        nominal = _as_float(body, "nominal_target_mm", 0.0)
+        measured = _as_float(body, "measured_mm", nominal)
+        reason = str(body.get("reason", "控制台触发重新标定"))
+        return self._platform.recalibrate_guide(group, nominal, measured, reason=reason)
 
     def _disturb(self, params: dict, body: dict) -> dict:
         return self._platform.disturb_collector(_as_float(body, "delta_pa", 0.0))

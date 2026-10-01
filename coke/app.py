@@ -15,6 +15,8 @@ from .audit.log import AuditLog
 from .audit.record import AuditRecord
 from .charger.machine import ChargingCar
 from .clock import Clock, SystemClock
+from .compensation.compensator import GuideDriftCompensator
+from .compensation.policy import VIOLATION_RECALIBRATION_REQUIRED
 from .config import PlatformConfig, default_config
 from .door.latch import DoorLatch
 from .door.machine import DoorCleaner
@@ -80,6 +82,9 @@ class Platform:
             self.config.pusher.speed_default_mm_s,
         )
         self.guide = GuideCar(self.config.guide)
+        self.guide_compensation = GuideDriftCompensator(
+            self.config.guide_compensation, self.clock, self.bus, store
+        )
         self.charger = ChargingCar(self.config.charger)
         self.quench_car = QuenchCar(self.config.quench)
         self.collector = CollectorMain(self.config.collector)
@@ -240,25 +245,78 @@ class Platform:
         stroke_target_mm: float | None = None,
         speed_mm_s: float | None = None,
         dt: float = 1.0,
+        group: str | None = None,
     ) -> dict:
-        """推焦编排：导焦栅对位 → 锁定 → 推焦 → 退杆；同时触发除尘联动。"""
+        """推焦编排：导焦栅对位（带漂移补偿门）→ 锁定 → 推焦 → 退杆。
+
+        导焦栅目标位按炉组补偿：未显式传 ``guide_target_mm`` 时取该炉组当前
+        标定版本的名义目标位；补偿门给出有效目标位（名义目标 + 学习偏移），
+        漂移超限且炉组策略为停机时，本炉组直接拒绝推焦并报重新标定。
+        """
 
         with self._lock:
+            group = group or self.unit
+            if not self.guide_compensation.has_group(group):
+                # 补偿按炉组定死：炉组未登记即拒绝，绝不静默摊到别的炉组。
+                raise CokeError(
+                    f"炉组 {group!r} 未登记导焦栅补偿（已登记：{self.guide_compensation.groups()}）",
+                    component="compensation",
+                )
+            if not guide_target_mm:
+                guide_target_mm = self.guide_compensation.baseline(group).nominal_target_mm
+
             op_id = self.ids.next()
             target = self.stroke.baseline_mm if stroke_target_mm is None else stroke_target_mm
             self.speed.request("auto_cycle", speed_mm_s or self.config.pusher.speed_default_mm_s, priority=50)
             arbitration = self.speed.resolve()
             self.schedule.start_link(self.clock.now())
+
+            gate = self.guide_compensation.gate_alignment(
+                group,
+                oven,
+                guide_target_mm,
+                guide_measured_mm,
+                self.guide.align_tolerance(),
+            )
+            if gate["blocked"]:
+                # 漂移超限且炉组策略要求重新标定（或补偿量触物理硬顶）：
+                # 不做对位、不锁栅、不推焦，按违约项拒绝并写审计。
+                report = {
+                    "oven": oven,
+                    "ok": False,
+                    "steps": [],
+                    "violations": [VIOLATION_RECALIBRATION_REQUIRED],
+                    "guide_gate": {key: value for key, value in gate.items() if key != "conclusion"},
+                }
+                report["speed_arbitration"] = arbitration.as_dict()
+                summary = self._record_operation(op_id, "push", report)
+                summary["op_id"] = op_id
+                self._operations += 1
+                self._persist()
+                return {**report, **summary}
+
             report = push_oven(
                 self.pusher,
                 self.guide,
                 oven,
-                guide_target_mm,
+                gate["effective_target_mm"],
                 guide_measured_mm,
                 target,
                 arbitration.speed_mm_s,
                 dt,
             )
+            lock_step = next(
+                (
+                    step
+                    for step in report.get("steps", ())
+                    if step.get("action") == "lock_apron"
+                ),
+                None,
+            )
+            lock_locked = bool(lock_step["detail"].get("locked")) if lock_step else False
+            self.guide_compensation.record_lock_outcome(group, oven, locked=lock_locked, detail="")
+            report["group"] = group
+            report["guide_gate"] = {key: value for key, value in gate.items() if key != "conclusion"}
             stroke_check = self.stroke.check(self.pusher.ram_mm)
             report["speed_arbitration"] = arbitration.as_dict()
             report["stroke_check"] = stroke_check
@@ -388,6 +446,54 @@ class Platform:
         )
         return {"before_mm": before, "after_mm": after, "epoch": self.stroke.epoch}
 
+    def recalibrate_guide(
+        self,
+        group: str,
+        nominal_target_mm: float,
+        measured_mm: float,
+        *,
+        reason: str = "人工重新标定",
+    ) -> dict:
+        """导焦栅标定基线换代（版本迁移），解除该炉组的重新标定联锁。"""
+
+        if nominal_target_mm < 0:
+            raise CokeError("导焦栅标定目标位不得为负", component="guide")
+        if not self.guide_compensation.has_group(group):
+            raise CokeError(
+                f"炉组 {group!r} 未登记导焦栅补偿",
+                component="compensation",
+            )
+        return self.guide_compensation.recalibrate(
+            group, float(nominal_target_mm), float(measured_mm), reason=reason
+        )
+
+    def guide_compensation_summary(self) -> dict:
+        """全部炉组的漂移补偿摘要，供控制台展示。"""
+
+        return self.guide_compensation.summary()
+
+    def guide_drift_blocked_groups(self) -> list[str]:
+        """返回因漂移超限被停机、等待重新标定的炉组。"""
+
+        return [group for group in self.guide_compensation.groups() if self.guide_compensation.is_blocked(group)]
+
+    def guide_compensation_review(self, group: str, limit: int = 200) -> dict:
+        """重放并核对某炉组的历史补偿结论与标定版本是否一致。"""
+
+        if not self.guide_compensation.has_group(group):
+            raise CokeError(f"炉组 {group!r} 未登记导焦栅补偿", component="compensation")
+        return self.guide_compensation.review(group, limit=limit)
+
+    def guide_compensation_history(self, group: str, limit: int = 200) -> dict:
+        """读取某炉组的补偿流水（结论 + 迁移 + 锁栅反馈）。"""
+
+        if not self.guide_compensation.has_group(group):
+            raise CokeError(f"炉组 {group!r} 未登记导焦栅补偿", component="compensation")
+        return {
+            "group": group,
+            "records": self.guide_compensation.history(group, limit=limit),
+        }
+
     def disturb_collector(self, delta_pa: float) -> dict:
         """模拟一次集气管扰动，返回扰动后压力。"""
 
@@ -469,6 +575,7 @@ class Platform:
                 "epoch": self.stroke.epoch,
             },
             "guide": self.guide.snapshot().as_dict(),
+            "guide_compensation": self.guide_compensation_summary(),
             "charger": self.charger.snapshot().as_dict(),
             "quench": self.quench_car.snapshot().as_dict(),
             "gas": {

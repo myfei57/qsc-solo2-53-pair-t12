@@ -11,9 +11,14 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Mapping
 
 from .errors import ConfigError
+from .compensation.policy import (
+    OVERLIMIT_POLICIES,
+    SCOPE_BATTERY_GROUP,
+)
 
 _MISSING = object()
 
@@ -213,6 +218,84 @@ class DustLimits:
 
 
 @dataclass(frozen=True)
+class GuideCompensationConfig:
+    """导焦栅漂移补偿配置（粒度定死按炉组）。"""
+
+    scope: str
+    sample_window: int
+    min_samples: int
+    deadband_mm: float
+    drift_limit_mm: float
+    max_step_mm: float
+    max_correction_mm: float
+    group_policies: MappingProxyType
+    nominal_targets_mm: MappingProxyType
+
+    @classmethod
+    def from_mapping(cls, section: Mapping[str, Any]) -> "GuideCompensationConfig":
+        scope = str(section.get("scope", SCOPE_BATTERY_GROUP))
+        if scope != SCOPE_BATTERY_GROUP:
+            # 补偿粒度定死：只按炉组独立算，不支持全厂统一。
+            raise ConfigError(
+                f"导焦栅补偿粒度仅支持 {SCOPE_BATTERY_GROUP!r}，不支持全厂统一口径，收到 {scope!r}",
+                component="config",
+            )
+        sample_window = int(_number(section, "sample_window", minimum=2))
+        min_samples = int(_number(section, "min_samples", minimum=2))
+        if min_samples > sample_window:
+            raise ConfigError("min_samples 不得大于 sample_window", component="config")
+        deadband = _number(section, "deadband_mm", minimum=0.0)
+        drift_limit = _number(section, "drift_limit_mm", minimum=0.0)
+        max_step = _number(section, "max_step_mm", minimum=0.0)
+        max_correction = _number(section, "max_correction_mm", minimum=0.0)
+        if max_step > max_correction:
+            raise ConfigError("单次补偿步长不得超过累计补偿上限", component="config")
+
+        policies_raw = section.get("group_policies", {})
+        if not isinstance(policies_raw, Mapping) or not policies_raw:
+            raise ConfigError("group_policies 必须是非空映射（至少配置一个炉组）", component="config")
+        group_policies: dict[str, str] = {}
+        for group, policy in policies_raw.items():
+            if not isinstance(group, str) or not group:
+                raise ConfigError("炉组名必须是非空字符串", component="config")
+            if policy not in OVERLIMIT_POLICIES:
+                raise ConfigError(
+                    f"炉组 {group} 的超限策略必须是 {OVERLIMIT_POLICIES} 之一，收到 {policy!r}",
+                    component="config",
+                )
+            group_policies[group] = str(policy)
+
+        nominals_raw = section.get("nominal_targets_mm", {})
+        if not isinstance(nominals_raw, Mapping) or not nominals_raw:
+            raise ConfigError("nominal_targets_mm 必须是非空映射（每炉组的标定名义目标位）", component="config")
+        nominal_targets: dict[str, float] = {}
+        for group, value in nominals_raw.items():
+            nominal_targets[str(group)] = _number(nominals_raw, str(group), minimum=0.0)
+        missing = sorted(set(group_policies) - set(nominal_targets))
+        if missing:
+            raise ConfigError(f"炉组 {missing} 缺少名义目标位 nominal_targets_mm", component="config")
+
+        return cls(
+            scope=scope,
+            sample_window=sample_window,
+            min_samples=min_samples,
+            deadband_mm=deadband,
+            drift_limit_mm=drift_limit,
+            max_step_mm=max_step,
+            max_correction_mm=max_correction,
+            group_policies=MappingProxyType(dict(group_policies)),
+            nominal_targets_mm=MappingProxyType(dict(nominal_targets)),
+        )
+
+    def nominal_target_for(self, group: str) -> float:
+        """返回某炉组配置的标定名义目标位。"""
+
+        if group not in self.nominal_targets_mm:
+            raise ConfigError(f"炉组 {group!r} 未配置名义目标位", component="config")
+        return float(self.nominal_targets_mm[group])
+
+
+@dataclass(frozen=True)
 class PlatformConfig:
     """一份完整的平台配置。"""
 
@@ -226,6 +309,7 @@ class PlatformConfig:
     door: DoorLimits
     heating: HeatingLimits
     dust: DustLimits
+    guide_compensation: GuideCompensationConfig
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, Any]) -> "PlatformConfig":
@@ -238,6 +322,7 @@ class PlatformConfig:
             raise ConfigError("platform.storage_root 必须是非空字符串", component="config")
 
         limits = _section(mapping, "limits")
+        compensation_section = _section(mapping, "guide_compensation")
         return cls(
             name=name,
             storage_root=storage_root,
@@ -249,6 +334,7 @@ class PlatformConfig:
             door=DoorLimits.from_mapping(_section(limits, "door")),
             heating=HeatingLimits.from_mapping(_section(limits, "heating")),
             dust=DustLimits.from_mapping(_section(limits, "dust")),
+            guide_compensation=GuideCompensationConfig.from_mapping(compensation_section),
         )
 
 
@@ -262,6 +348,30 @@ def load_config(path: str) -> PlatformConfig:
     if not isinstance(raw, Mapping):
         raise ConfigError("配置文件顶层必须是映射", component="config")
     return PlatformConfig.from_mapping(raw)
+
+
+def default_guide_compensation_config() -> GuideCompensationConfig:
+    """内置默认的导焦栅漂移补偿配置：两个示例炉组，两种超限策略各占其一。"""
+
+    return GuideCompensationConfig.from_mapping(
+        {
+            "scope": SCOPE_BATTERY_GROUP,
+            "sample_window": 20,
+            "min_samples": 3,
+            "deadband_mm": 2.0,
+            "drift_limit_mm": 10.0,
+            "max_step_mm": 5.0,
+            "max_correction_mm": 20.0,
+            "group_policies": {
+                "battery1": "recalibrate",
+                "battery2": "compensate",
+            },
+            "nominal_targets_mm": {
+                "battery1": 0.0,
+                "battery2": 0.0,
+            },
+        }
+    )
 
 
 def default_config() -> PlatformConfig:
@@ -278,6 +388,7 @@ def default_config() -> PlatformConfig:
         door=DoorLimits(60.0, 45.0),
         heating=HeatingLimits(1800.0, 1180.0, 35.0, 4.0),
         dust=DustLimits(70.0, 14.0, 1.5),
+        guide_compensation=default_guide_compensation_config(),
     )
 
 
@@ -286,6 +397,17 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
 
     return {
         "platform": {"name": cfg.name, "storage_root": cfg.storage_root},
+        "guide_compensation": {
+            "scope": cfg.guide_compensation.scope,
+            "sample_window": cfg.guide_compensation.sample_window,
+            "min_samples": cfg.guide_compensation.min_samples,
+            "deadband_mm": cfg.guide_compensation.deadband_mm,
+            "drift_limit_mm": cfg.guide_compensation.drift_limit_mm,
+            "max_step_mm": cfg.guide_compensation.max_step_mm,
+            "max_correction_mm": cfg.guide_compensation.max_correction_mm,
+            "group_policies": dict(cfg.guide_compensation.group_policies),
+            "nominal_targets_mm": dict(cfg.guide_compensation.nominal_targets_mm),
+        },
         "limits": {
             "pusher": {
                 "stroke_baseline_mm": cfg.pusher.stroke_baseline_mm,
